@@ -41,9 +41,15 @@ func (c *client) Do(req *http.Request) (*http.Response, error) {
 	// airscan hardcodes /eSCL; honor the endpoint advertised by mDNS.
 	req.URL.Scheme, req.URL.Host = c.base.Scheme, c.base.Host
 	req.URL.Path = strings.TrimRight(c.base.Path, "/") + strings.TrimPrefix(req.URL.Path, "/eSCL")
+	log.Printf("eSCL → %s %s", req.Method, req.URL)
+	start := time.Now()
 	resp, err := c.Client.Do(req)
 	if resp != nil {
 		c.body = resp.Body
+		log.Printf("eSCL ← %s (%s); location=%q", resp.Status, time.Since(start).Round(time.Millisecond), resp.Header.Get("Location"))
+	}
+	if err != nil {
+		log.Printf("eSCL request failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
 	}
 	return resp, err
 }
@@ -167,6 +173,7 @@ func Scan(ctx context.Context, cfg Config) (string, error) {
 		if err != nil {
 			return dir, err
 		}
+		log.Printf("downloading %s", name)
 		page := job.CurrentPage()
 		header := make([]byte, 5)
 		_, err = io.ReadFull(page, header)

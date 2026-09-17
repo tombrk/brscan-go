@@ -2,35 +2,45 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"brscan-go/brscankey"
 	"brscan-go/scanner"
+	"github.com/adrg/xdg"
 	"github.com/brutella/dnssd"
+	"github.com/brutella/hap"
+	"github.com/brutella/hap/accessory"
 )
 
 type Config struct {
-	Scanner, Advertise, Name, Dir string
-	DPI                           int
+	Scanner, Name, Dir, State string
+	DPI                       int
+	Now                       bool
 }
 
 func main() {
 	var c Config
 	flag.StringVar(&c.Scanner, "scanner", "", "scanner IPv4 address (default: mDNS discovery)")
-	flag.StringVar(&c.Advertise, "advertise", "", "local LAN IPv4 address (default: route to scanner)")
-	flag.StringVar(&c.Name, "name", "Scan", "destination prefix (adds Text and Color)")
+	flag.StringVar(&c.Name, "name", "Brother Scan", "HomeKit accessory name")
 	flag.StringVar(&c.Dir, "dir", "scans", "output directory")
+	flag.StringVar(&c.State, "state", filepath.Join(xdg.StateHome, "brscan-go"), "persistent HomeKit pairing directory")
 	flag.IntVar(&c.DPI, "dpi", 300, "resolution (validated against scanner capabilities)")
+	flag.BoolVar(&c.Now, "now", false, "scan a color PDF immediately without starting HomeKit")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -44,7 +54,10 @@ func run(ctx context.Context, c Config) error {
 	endpoint := "http://" + c.Scanner + "/eSCL"
 	if c.Scanner == "" {
 		log.Print("discovering Brother scanners for 5s")
-		discoveryCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+		// dnssd's readers recognize Canceled, not DeadlineExceeded.
+		discoveryCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+		timer := time.AfterFunc(5*time.Second, stop)
+		stopParent := context.AfterFunc(ctx, stop)
 		found := map[string]string{}
 		err := dnssd.LookupType(discoveryCtx, "_uscan._tcp.local.", func(e dnssd.BrowseEntry) {
 			if !strings.Contains(strings.ToLower(e.Text["ty"]+e.Name), "brother") {
@@ -60,8 +73,10 @@ func run(ctx context.Context, c Config) error {
 					found[ip.String()] = u.String()
 				}
 			}
-		}, nil)
+		}, func(dnssd.BrowseEntry) {})
 		stop()
+		timer.Stop()
+		stopParent()
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -77,53 +92,111 @@ func run(ctx context.Context, c Config) error {
 	if ip := net.ParseIP(c.Scanner); ip.To4() == nil {
 		return fmt.Errorf("scanner must be an IPv4 address")
 	}
-	if c.Advertise == "" {
-		conn, err := net.Dial("udp4", net.JoinHostPort(c.Scanner, "161"))
-		if err != nil {
-			return err
-		}
-		c.Advertise = conn.LocalAddr().(*net.UDPAddr).IP.String()
-		conn.Close()
-	}
 	if err := os.MkdirAll(c.Dir, 0700); err != nil {
 		return err
 	}
-	log.Printf("scanner %s; callback IP %s; output %s", endpoint, c.Advertise, c.Dir)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	text, color := make(chan struct{}), make(chan struct{}) // No queued scans.
-	keyErrors := make(chan error, 2)
-	var listeners sync.WaitGroup
-	listeners.Go(func() {
-		keyErrors <- brscankey.Notify(ctx, text, brscankey.Config{
-			Scanner: c.Scanner, Host: c.Advertise, Name: c.Name + " Text",
-		})
-	})
-	listeners.Go(func() {
-		keyErrors <- brscankey.Notify(ctx, color, brscankey.Config{
-			Scanner: c.Scanner, Host: c.Advertise, Name: c.Name + " Color",
-		})
-	})
-	defer func() { cancel(); listeners.Wait() }()
-	for {
-		var mode string
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case err := <-keyErrors:
-			return err
-		case <-text:
-			mode = "BlackAndWhite1"
-		case <-color:
-			mode = "RGB24"
-		}
-		scanCtx, stop := context.WithTimeout(ctx, 10*time.Minute)
-		dir, err := scanner.Scan(scanCtx, scanner.Config{URL: endpoint, Dir: c.Dir, DPI: c.DPI, Color: mode})
-		stop()
-		if err != nil {
-			log.Printf("scan failed: %v", err)
-		} else {
+	log.Printf("scanner %s; output %s", endpoint, c.Dir)
+	scan := func(ctx context.Context, mode string) error {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+		dir, err := scanner.Scan(ctx, scanner.Config{URL: endpoint, Dir: c.Dir, DPI: c.DPI, Color: mode})
+		if err == nil {
 			log.Printf("saved %s", dir)
 		}
+		return err
 	}
+	if c.Now {
+		return scan(ctx, "RGB24")
+	}
+	if err := os.MkdirAll(c.State, 0700); err != nil {
+		return err
+	}
+	store := hap.NewFsStore(c.State)
+	pin, err := store.Get("pin")
+	if errors.Is(err, os.ErrNotExist) {
+		for {
+			n, err := rand.Int(rand.Reader, big.NewInt(100000000))
+			if err != nil {
+				return err
+			}
+			pin = []byte(fmt.Sprintf("%08d", n.Int64()))
+			if !hap.InvalidPins[string(pin)] {
+				break
+			}
+		}
+		if err := store.Set("pin", pin); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if _, err := strconv.Atoi(string(pin)); err != nil || len(pin) != 8 || hap.InvalidPins[string(pin)] {
+		return fmt.Errorf("invalid pairing PIN in %s", c.State)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type request struct {
+		switchAccessory *accessory.Switch
+		mode            string
+	}
+	requests := make(chan request, 1)
+	var busy atomic.Bool
+	bridge := accessory.NewBridge(accessory.Info{Name: c.Name, Manufacturer: "brscan-go", SerialNumber: "bridge"})
+	bridge.Id = 1
+	accessories := []*accessory.A{}
+	for i, profile := range []struct{ name, mode string }{
+		{"Scan Color", "RGB24"}, {"Scan Text", "BlackAndWhite1"},
+	} {
+		a := accessory.NewSwitch(accessory.Info{Name: profile.name, Manufacturer: "brscan-go", SerialNumber: profile.mode})
+		a.Id = uint64(i + 2) // Stable IDs across restarts.
+		a.Switch.On.SetValueRequestFunc = func(value interface{}, _ *http.Request) (interface{}, int) {
+			if ctx.Err() != nil {
+				return nil, -70402 // Unable to communicate.
+			}
+			if !value.(bool) {
+				if busy.Load() {
+					return nil, -70403 // Off doesn't cancel an active scan.
+				}
+				return nil, 0
+			}
+			if !busy.CompareAndSwap(false, true) {
+				return nil, -70403 // Resource busy: no queued/overlapping scans.
+			}
+			return nil, 0
+		}
+		// This callback runs after HAP has set the characteristic to On.
+		a.Switch.On.OnValueRemoteUpdate(func(on bool) {
+			if on {
+				requests <- request{a, profile.mode}
+			}
+		})
+		accessories = append(accessories, a.A)
+	}
+	srv, err := hap.NewServer(store, bridge.A, accessories...)
+	if err != nil {
+		return err
+	}
+	srv.Pin = string(pin)
+	if !srv.IsPaired() {
+		fmt.Printf("HomeKit pairing code: %s-%s-%s\n", pin[:3], pin[3:5], pin[5:])
+	}
+	log.Printf("HomeKit %q: pair using Home Assistant's HomeKit Device integration", c.Name)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case req := <-requests:
+				if err := scan(ctx, req.mode); err != nil {
+					log.Printf("scan failed: %v", err)
+				}
+				req.switchAccessory.Switch.On.SetValue(false)
+				busy.Store(false)
+			}
+		}
+	}()
+	defer func() { cancel(); <-done }()
+	return srv.ListenAndServe(ctx)
 }

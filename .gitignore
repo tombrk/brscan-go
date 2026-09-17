@@ -1,0 +1,5 @@
+/.brscan/
+/scans/
+/brscan-go
+/pcap
+/*.pcap
